@@ -177,6 +177,7 @@ public class RedissonLock extends RedissonBaseLock {
     }
 
     private <T> RFuture<Long> tryAcquireAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId) {
+        //情况一，如果锁有时长，则直接获得分布式锁
         RFuture<Long> ttlRemainingFuture;
         if (leaseTime != -1) {
             ttlRemainingFuture = tryLockInnerAsync(waitTime, leaseTime, unit, threadId, RedisCommands.EVAL_LONG);
@@ -194,6 +195,7 @@ public class RedissonLock extends RedissonBaseLock {
                 if (leaseTime != -1) {
                     internalLockLeaseTime = unit.toMillis(leaseTime);
                 } else {
+                    // 如果获得到锁，则创建定时任务，定时续锁
                     scheduleExpirationRenewal(threadId);
                 }
             }
@@ -297,11 +299,22 @@ public class RedissonLock extends RedissonBaseLock {
         }
 //        return get(tryLockAsync(waitTime, leaseTime, unit));
     }
-
+    /**
+     * 异步发起订阅
+     *
+     * @param threadId 线程编号
+     * @return RFuture 对象
+     */
     protected RFuture<RedissonLockEntry> subscribe(long threadId) {
         return pubSub.subscribe(getEntryName(), getChannelName());
     }
 
+    /**
+     * 异步取消订阅
+     *
+     * @param future RFuture 对象
+     * @param threadId 线程编号
+     */
     protected void unsubscribe(RFuture<RedissonLockEntry> future, long threadId) {
         pubSub.unsubscribe(future.getNow(), getEntryName(), getChannelName());
     }
@@ -499,64 +512,88 @@ public class RedissonLock extends RedissonBaseLock {
         return tryLockAsync(waitTime, leaseTime, unit, currentThreadId);
     }
 
+    /**
+     * 整体逻辑是，获得分布锁。如果获取失败，则发起 Redis Pub/Sub 订阅，等待释放锁的消息，从而再次发起获得分布式锁。
+     * @param waitTime time interval to acquire lock
+     * @param leaseTime time interval after which lock will be released automatically
+     * @param unit the time unit of the {@code waitTime} and {@code leaseTime} arguments
+     * @param currentThreadId
+     * @return
+     */
     @Override
     public RFuture<Boolean> tryLockAsync(long waitTime, long leaseTime, TimeUnit unit,
             long currentThreadId) {
+        // 创建 RPromise 对象，用于通知结果
         RPromise<Boolean> result = new RedissonPromise<Boolean>();
-
+        // 表示剩余的等待获得锁的时间
         AtomicLong time = new AtomicLong(unit.toMillis(waitTime));
         long currentTime = System.currentTimeMillis();
         RFuture<Long> ttlFuture = tryAcquireAsync(waitTime, leaseTime, unit, currentThreadId);
         ttlFuture.onComplete((ttl, e) -> {
+            // 如果发生异常，则通过 result 通知异常
             if (e != null) {
                 result.tryFailure(e);
                 return;
             }
 
             // lock acquired
+            // 如果获得到锁，则通过 result 通知获得锁成功
             if (ttl == null) {
+                // 如果处理 result 通知对结果返回 false ，意味着需要异常释放锁
                 if (!result.trySuccess(true)) {
                     unlockAsync(currentThreadId);
                 }
                 return;
             }
 
+            // 减掉已经等待的时间
             long el = System.currentTimeMillis() - currentTime;
             time.addAndGet(-el);
-            
+            // 如果无剩余等待的时间，则通过 result 通知获得锁失败
             if (time.get() <= 0) {
                 trySuccessFalse(currentThreadId, result);
                 return;
             }
             
             long current = System.currentTimeMillis();
+            // 记录下面的 future 的指向
             AtomicReference<Timeout> futureRef = new AtomicReference<Timeout>();
+
+            // 创建 SUBSCRIBE 订阅的 Future
+            //通过订阅释放锁的消息，从而实现等待锁释放的客户端，快速抢占加锁。
             RFuture<RedissonLockEntry> subscribeFuture = subscribe(currentThreadId);
             subscribeFuture.onComplete((r, ex) -> {
+                // 如果发生异常，则通过 result 通知异常
                 if (ex != null) {
                     result.tryFailure(ex);
                     return;
                 }
 
+                // 如果创建定时任务 Future scheduledFuture，则进行取消
                 if (futureRef.get() != null) {
                     futureRef.get().cancel();
                 }
 
                 long elapsed = System.currentTimeMillis() - current;
                 time.addAndGet(-elapsed);
-                
+                // 再次执行异步获得锁
                 tryLockAsync(time, waitTime, leaseTime, unit, subscribeFuture, result, currentThreadId);
             });
+            // 如果创建 SUBSCRIBE 订阅的 Future 未完成，创建定时任务 Future scheduledFuture 。
             if (!subscribeFuture.isDone()) {
                 Timeout scheduledFuture = commandExecutor.getConnectionManager().newTimeout(new TimerTask() {
                     @Override
                     public void run(Timeout timeout) throws Exception {
+                        // 如果创建 SUBSCRIBE 订阅的 Future 未完成
                         if (!subscribeFuture.isDone()) {
+                            // 进行取消 subscribeFuture
                             subscribeFuture.cancel(false);
+                            // 通过 result 通知获得锁失败
                             trySuccessFalse(currentThreadId, result);
                         }
                     }
-                }, time.get(), TimeUnit.MILLISECONDS);
+                }, time.get(), TimeUnit.MILLISECONDS);// 延迟 time 秒后执行
+                // 记录 futureRef 执行 scheduledFuture
                 futureRef.set(scheduledFuture);
             }
         });
@@ -575,22 +612,36 @@ public class RedissonLock extends RedissonBaseLock {
         });
     }
 
+    /**
+     * 1、增加监听锁释放的消息的监听器，从而实现等待锁的客户端快速抢占锁的逻辑。
+     * 2、增加锁超时自动释放，没有锁释放消息的处理。
+     * @param time
+     * @param waitTime
+     * @param leaseTime
+     * @param unit
+     * @param subscribeFuture
+     * @param result
+     * @param currentThreadId
+     */
     private void tryLockAsync(AtomicLong time, long waitTime, long leaseTime, TimeUnit unit,
             RFuture<RedissonLockEntry> subscribeFuture, RPromise<Boolean> result, long currentThreadId) {
+        // 如果 result 已经完成，则直接返回，并取消订阅
         if (result.isDone()) {
             unsubscribe(subscribeFuture, currentThreadId);
             return;
         }
-        
+        // 如果剩余时间 time 小于 0 ，说明等待超时，则取消订阅，并通过 result 通知失败
         if (time.get() <= 0) {
             unsubscribe(subscribeFuture, currentThreadId);
             trySuccessFalse(currentThreadId, result);
             return;
         }
-        
+
         long curr = System.currentTimeMillis();
+        // 获得分布式锁
         RFuture<Long> ttlFuture = tryAcquireAsync(waitTime, leaseTime, unit, currentThreadId);
         ttlFuture.onComplete((ttl, e) -> {
+                // 如果发生异常，则取消订阅，并通过 result 通知异常
                 if (e != null) {
                     unsubscribe(subscribeFuture, currentThreadId);
                     result.tryFailure(e);
@@ -598,6 +649,7 @@ public class RedissonLock extends RedissonBaseLock {
                 }
 
                 // lock acquired
+            // 如果获得到锁，则取消订阅，并通过 result 通知获得锁成功
                 if (ttl == null) {
                     unsubscribe(subscribeFuture, currentThreadId);
                     if (!result.trySuccess(true)) {
@@ -617,14 +669,21 @@ public class RedissonLock extends RedissonBaseLock {
 
                 // waiting for message
                 long current = System.currentTimeMillis();
+                // 获得当前线程对应的 RedissonLockEntry 对象
                 RedissonLockEntry entry = subscribeFuture.getNow();
+            // 尝试获得 entry 中的信号量，如果获得成功，说明 SUBSCRIBE 已经收到释放锁的消息，则直接立马再次去获得锁。
                 if (entry.getLatch().tryAcquire()) {
                     tryLockAsync(time, waitTime, leaseTime, unit, subscribeFuture, result, currentThreadId);
                 } else {
+                    // 创建 AtomicBoolean 变量 executed ，用于标记下面创建的 listener 是否执行。
                     AtomicBoolean executed = new AtomicBoolean();
+                    // 创建 AtomicReference 对象，用于指向定时任务
                     AtomicReference<Timeout> futureRef = new AtomicReference<Timeout>();
+                    // 创建监听器 listener ，用于在 RedissonLockEntry 的回调，就是我们看到的 PublishSubscribe 监听到释放锁的消息，进行回调
                     Runnable listener = () -> {
+                        // 标记已经执行
                         executed.set(true);
+                        // 如果有定时任务的 Future ，则进行取消
                         if (futureRef.get() != null) {
                             futureRef.get().cancel();
                         }
@@ -634,12 +693,16 @@ public class RedissonLock extends RedissonBaseLock {
                         
                         tryLockAsync(time, waitTime, leaseTime, unit, subscribeFuture, result, currentThreadId);
                     };
+                    // 添加 listener 到 RedissonLockEntry 中
                     entry.addListener(listener);
-
+                    // 下面，会创建一个定时任务。因为极端情况下，可能不存在释放锁的消息，
+                    // 例如说锁自动超时释放，所以需要改定时任务，在获得到锁的超时后，主动去抢下。
                     long t = time.get();
+                    // 如果剩余时间小于锁的超时时间，则使用剩余时间。
                     if (ttl >= 0 && ttl < time.get()) {
                         t = ttl;
                     }
+                    // 如果 listener 未执行
                     if (!executed.get()) {
                         Timeout scheduledFuture = commandExecutor.getConnectionManager().newTimeout(new TimerTask() {
                             @Override
