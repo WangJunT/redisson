@@ -177,10 +177,31 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
             renewExpiration();
         }
     }
-
+    //实现续锁逻辑。
+    /**
+     * 大家都知道，如果负责储存这个分布式锁的Redisson节点宕机以后，
+     * 而且这个锁正好处于锁住的状态时，这个锁会出现锁死的状态。
+     * 为了避免这种情况的发生，Redisson内部提供了一个监控锁的看门狗，
+     * 它的作用是在Redisson实例被关闭前，不断的延长锁的有效期。
+     * 默认情况下，看门狗的检查锁的超时时间是30秒钟，也可以通过修改 Config.lockWatchdogTimeout 来另行指定。
+     *
+     *
+     *
+     * 在使用 RedissonLock#lock() 方法，我们要求持续持有锁，直到手动释放。
+     * 但是实际上，我们有一个隐藏条件，如果 Java 进程挂掉时，需要自动释放。
+     * 那么，如果实现 RedissonLock#lock() 时，设置过期 Redis 为无限大，或者不过期都不合适。
+     * 那么 RedissonLock 是怎么实现的呢？
+     * RedissonLock 先获得一个 internalLockLeaseTime 的分布式锁，然后每 internalLockLeaseTime / 3 时间，
+     * 定时调用 #renewExpirationAsync(long threadId) 方法，进行续租。这样，在 Java 进程异常 Crash 掉后，
+     * 能够保证最多 internalLockLeaseTime 时间后，分布式锁自动释放。
+     *
+     * 略骚略巧妙~不过为了实现这样的功能，RedissonLock 的整体逻辑，又复杂了一丢丢。
+     * @param threadId
+     * @return
+     */
     protected RFuture<Boolean> renewExpirationAsync(long threadId) {
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
-                "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then " +
+                "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then " +// 情况一，如果持有锁，则重新设置过期时间为 ARGV[1] internalLockLeaseTime ，并返回 1 续租成功。
                         "redis.call('pexpire', KEYS[1], ARGV[1]); " +
                         "return 1; " +
                         "end; " +

@@ -55,10 +55,17 @@ public class RedissonLock extends RedissonBaseLock {
     public RedissonLock(CommandAsyncExecutor commandExecutor, String name) {
         super(commandExecutor, name);
         this.commandExecutor = commandExecutor;
+        /**
+         *     1.默认情况下，internalLockLeaseTime 属性，使用 Lock 的 WatchDog 的超时时长 30 * 1000 毫秒。
+         *         默认的值，当且仅当我们未显示传入锁的时长时，才有用。例如说，稍后我们会看到的 #lock() 等等方法中。
+         *
+         *     2.有一点，我们要特别注意，internalLockLeaseTime 是 RedissonLock 的成员变量，并且也未声明 volatile 修饰，
+         *         所以跨线程使用同一个 RedissonLock 对象，可能会存在 internalLockLeaseTime 读取不到最新值的情况。
+         */
+
         this.internalLockLeaseTime = commandExecutor.getConnectionManager().getCfg().getLockWatchdogTimeout();
         this.pubSub = commandExecutor.getConnectionManager().getSubscribeService().getLockPubSub();
     }
-
     String getChannelName() {
         return prefixName("redisson_lock__channel", getRawName());
     }
@@ -199,20 +206,24 @@ public class RedissonLock extends RedissonBaseLock {
         return get(tryLockAsync());
     }
 
+    // leaseTime+unit 构成锁的超时时间
     <T> RFuture<T> tryLockInnerAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId, RedisStrictCommand<T> command) {
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, command,
-                "if (redis.call('exists', KEYS[1]) == 0) then " +
-                        "redis.call('hincrby', KEYS[1], ARGV[2], 1); " +
-                        "redis.call('pexpire', KEYS[1], ARGV[1]); " +
-                        "return nil; " +
+                "if (redis.call('exists', KEYS[1]) == 0) then " + //情况一：分布式锁未被获得
+                        "redis.call('hincrby', KEYS[1], ARGV[2], 1); " +//获得分布式锁的客户端 uuid+ thread_id 并且设置数量为 1
+                        "redis.call('pexpire', KEYS[1], ARGV[1]); " +  //设置过期时间 默认为 30s
+                        "return nil; " + // 返回 null ，表示成功
                         "end; " +
-                        "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then " +
-                        "redis.call('hincrby', KEYS[1], ARGV[2], 1); " +
-                        "redis.call('pexpire', KEYS[1], ARGV[1]); " +
-                        "return nil; " +
+                        "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then " +  //情况二 ： 是否是同一个客户端，如果是的话 数量加1
+                        "redis.call('hincrby', KEYS[1], ARGV[2], 1); " +  //数量加 1
+                        "redis.call('pexpire', KEYS[1], ARGV[1]); " +  //设置过期时间
+                        "return nil; " + // 返回 null ，表示成功
                         "end; " +
-                        "return redis.call('pttl', KEYS[1]);",
-                Collections.singletonList(getRawName()), unit.toMillis(leaseTime), getLockName(threadId));
+                        "return redis.call('pttl', KEYS[1]);", //情况三：分布式锁已被别的客户端获得，返回锁的过期时间
+                // KEYS[分布式锁名]
+                Collections.singletonList(getRawName()),
+                unit.toMillis(leaseTime), // ARGV[锁超时时间]
+                getLockName(threadId)); // ARGV[获得的锁名]该名字，用于表示该分布式锁正在被哪个进程的线程所持有。
     }
 
     @Override
@@ -328,35 +339,46 @@ public class RedissonLock extends RedissonBaseLock {
         return get(forceUnlockAsync());
     }
 
+    //强制释放锁
     @Override
     public RFuture<Boolean> forceUnlockAsync() {
         cancelExpirationRenewal(null);
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
-                "if (redis.call('del', KEYS[1]) == 1) then "
+                "if (redis.call('del', KEYS[1]) == 1) then "  // 情况一，释放锁成功，则通过 Publish 发布释放锁的消息，并返回 1
                         + "redis.call('publish', KEYS[2], ARGV[1]); "
                         + "return 1 "
                         + "else "
-                        + "return 0 "
+                        + "return 0 " // 情况二，释放锁失败，因为不存在这个 KEY ，所以返回 0
                         + "end",
                 Arrays.asList(getRawName(), getChannelName()), LockPubSub.UNLOCK_MESSAGE);
     }
 
+    /**
+     * 1、要实现可重入性，所以只有在计数为 0 时，才会真正释放锁。
+     * 2、要实现客户端的等待通知，所以在释放锁时，Publish 一条释放锁的消息。
+     * @param threadId
+     * @return
+     */
     protected RFuture<Boolean> unlockInnerAsync(long threadId) {
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
-                "if (redis.call('hexists', KEYS[1], ARGV[3]) == 0) then " +
+                "if (redis.call('hexists', KEYS[1], ARGV[3]) == 0) then " + //情况一：锁都不存在，何来释放
                         "return nil;" +
                         "end; " +
-                        "local counter = redis.call('hincrby', KEYS[1], ARGV[3], -1); " +
-                        "if (counter > 0) then " +
-                        "redis.call('pexpire', KEYS[1], ARGV[2]); " +
+                        "local counter = redis.call('hincrby', KEYS[1], ARGV[3], -1); " + //情况二：该客户端持有锁，持有锁的数量减 1 。
+                        "if (counter > 0) then " +                                 //情况二的分支一，该线程多次重入了改锁
+                        "redis.call('pexpire', KEYS[1], ARGV[2]); " +          // 重新设置过期时间为 ARGV[2]
                         "return 0; " +
                         "else " +
-                        "redis.call('del', KEYS[1]); " +
-                        "redis.call('publish', KEYS[2], ARGV[1]); " +
+                        "redis.call('del', KEYS[1]); " +                        //情况二的分支二，该线程只持有一个这个锁，直接释放锁
+                        "redis.call('publish', KEYS[2], ARGV[1]); " +           //告诉在等待这个锁的线程，锁已经被释放
                         "return 1; " +
                         "end; " +
                         "return nil;",
-                Arrays.asList(getRawName(), getChannelName()), LockPubSub.UNLOCK_MESSAGE, internalLockLeaseTime, getLockName(threadId));
+                Arrays.asList(getRawName(),// KEYS[分布式锁名]
+                        getChannelName()),//KEYS[该分布式锁对应的 Channel 名]调用 #getChannelName() 方法，该分布式锁对应的 Channel 名。
+               //因为 RedissonLock 释放锁时，会通过该 Channel 来 Publish 一条消息，通知其它可能在阻塞等待这条消息的客户端。
+                LockPubSub.UNLOCK_MESSAGE, //解锁消息 LockPubSub.UNLOCK_MESSAGE 。通过收到这条消息，其它等待锁的客户端，会重新发起获得锁的请求。
+                internalLockLeaseTime, getLockName(threadId));
     }
 
     @Override
